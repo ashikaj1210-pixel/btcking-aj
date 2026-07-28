@@ -27,43 +27,115 @@ os.makedirs(CHARTS_DIR, exist_ok=True)
 # ==========================================
 # 2. SMC & FIB OTE STRATEGY ENGINE
 # ==========================================
+def find_order_block(df_slice, bullish=True):
+    """
+    Very simple OB detector:
+    - Bullish OB = last down (red) candle before the impulsive up move.
+    - Bearish OB = last up (green) candle before the impulsive down move.
+    Falls back to the extreme candle itself if none is found.
+    """
+    if bullish:
+        down = df_slice[df_slice['close'] < df_slice['open']]
+        if not down.empty:
+            c = down.iloc[-1]
+        else:
+            c = df_slice.iloc[0]
+    else:
+        up = df_slice[df_slice['close'] > df_slice['open']]
+        if not up.empty:
+            c = up.iloc[-1]
+        else:
+            c = df_slice.iloc[0]
+    return float(c['high']), float(c['low'])
+
+
+def find_fvg(df_slice, bullish=True):
+    """
+    3-candle Fair Value Gap detector.
+    Bullish FVG: candle[i-1].high < candle[i+1].low  -> gap between them.
+    Bearish FVG: candle[i-1].low  > candle[i+1].high -> gap between them.
+    Returns the most recent gap found, or None.
+    """
+    rows = df_slice.reset_index(drop=True)
+    gap = None
+    for i in range(1, len(rows) - 1):
+        prev_c = rows.iloc[i - 1]
+        next_c = rows.iloc[i + 1]
+        if bullish and prev_c['high'] < next_c['low']:
+            gap = (float(prev_c['high']), float(next_c['low']))
+        elif not bullish and prev_c['low'] > next_c['high']:
+            gap = (float(next_c['high']), float(prev_c['low']))
+    return gap
+
+
 def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
     try:
         mexc = ccxt.mexc({'options': {'defaultType': 'swap'}})
         ohlcv = mexc.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
-        
+
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time_sec'] = df['time'] // 1000
 
-        recent_high = df['high'].tail(30).max()
-        recent_low = df['low'].tail(30).min()
+        last30 = df.tail(30).reset_index(drop=True)
+        recent_high = last30['high'].max()
+        recent_low = last30['low'].min()
         diff = recent_high - recent_low
 
         if diff == 0:
             return None, None
 
+        low_idx = int(last30['low'].idxmin())
+        high_idx = int(last30['high'].idxmax())
+        bullish = high_idx > low_idx  # impulse direction used for the setup
+
         fib_618 = recent_high - (diff * 0.618)
         fib_786 = recent_high - (diff * 0.786)
-        
+
         last_close = df['close'].iloc[-1]
-        candles = [{"time": int(row['time_sec']), "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close'], "volume": row['volume']} for _, row in df.iterrows()]
+
+        # --- Order Block ---
+        if bullish:
+            ob_slice = last30.iloc[max(0, low_idx - 3): low_idx + 1]
+            ob_top, ob_bottom = find_order_block(ob_slice, bullish=True)
+        else:
+            ob_slice = last30.iloc[max(0, high_idx - 3): high_idx + 1]
+            ob_top, ob_bottom = find_order_block(ob_slice, bullish=False)
+
+        # --- Fair Value Gap ---
+        move_slice = last30.iloc[min(low_idx, high_idx): max(low_idx, high_idx) + 1]
+        fvg = find_fvg(move_slice, bullish=bullish)
+        if fvg:
+            fvg_bottom, fvg_top = fvg
+        else:
+            fvg_bottom, fvg_top = fib_786, fib_618  # fallback to the OTE band
+
+        candles = [{"time": int(row['time_sec']), "open": row['open'], "high": row['high'],
+                    "low": row['low'], "close": row['close'], "volume": row['volume']}
+                   for _, row in df.iterrows()]
 
         sig_id = f"SIG_{int(time.time())}"
         trade = {
             "id_str": sig_id,
             "symbol": symbol,
             "tf": timeframe.upper(),
-            "strategy": "SMC Bullish Order Block + Fib OTE",
-            "side": "🟢 LONG",
+            "strategy": "SMC Order Block + FVG + Fib OTE",
+            "side": "🟢 LONG" if bullish else "🔴 SHORT",
+            "trend_bullish": bullish,
             "entry1": round(last_close, 2),
-            "entry2": round(last_close * 0.9995, 2),
-            "sl": round(recent_low, 2),
-            "tp1": round(recent_high, 2),
+            "entry2": round(last_close * (0.9995 if bullish else 1.0005), 2),
+            "sl": round(recent_low if bullish else recent_high, 2),
+            "tp1": round(recent_high if bullish else recent_low, 2),
             "rr": "2.75",
             "status": "ACTIVE",
             "pnl": 0.0,
             "chart_img": None,
-            "tg_msg_id": None
+            "tg_msg_id": None,
+            "ob_top": round(ob_top, 6),
+            "ob_bottom": round(ob_bottom, 6),
+            "fvg_top": round(fvg_top, 6),
+            "fvg_bottom": round(fvg_bottom, 6),
+            "fib_618": round(fib_618, 6),
+            "fib_786": round(fib_786, 6),
         }
         return trade, candles
 
@@ -78,12 +150,12 @@ def calculate_stats():
     total_trades = len(TRADE_HISTORY)
     if total_trades == 0:
         return {"total": 0, "wins": 0, "losses": 0, "win_rate": "0.0%", "pnl": 0.0}
-    
+
     wins = sum(1 for t in TRADE_HISTORY if t.get('status') == 'WIN')
     losses = sum(1 for t in TRADE_HISTORY if t.get('status') == 'LOSS')
     pnl = sum(t.get('pnl', 0.0) for t in TRADE_HISTORY)
     win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
-    
+
     return {
         "total": total_trades,
         "wins": wins,
@@ -92,100 +164,168 @@ def calculate_stats():
         "pnl": round(pnl, 2)
     }
 
+
 def generate_quickchart_image(candles, signal):
-    # Prepare candlestick data format [open, high, low, close]
-    chart_data = [{"x": time.strftime('%H:%M', time.localtime(c['time'])), "o": c['open'], "h": c['high'], "l": c['low'], "c": c['close']} for c in candles[-35:]]
-    
+    """
+    Renders a dark, TradingView-style candlestick chart with:
+      - Order Block zone (box)
+      - Fair Value Gap zone (box)
+      - Fib 0.618/0.786 OTE zone (box)
+      - Entry / SL / TP horizontal lines with labels
+    via quickchart.io (chart.js 2.9.4 + chartjs-chart-financial + chartjs-plugin-annotation).
+    """
+    visible = candles[-45:]
+    chart_data = [{
+        "x": time.strftime('%H:%M', time.localtime(c['time'])),
+        "o": c['open'], "h": c['high'], "l": c['low'], "c": c['close']
+    } for c in visible]
+
+    bullish = signal.get("trend_bullish", True)
+    up_color = "#089981"
+    down_color = "#f23645"
+    ob_color = "rgba(41, 98, 255, 0.18)"      # blue-ish OB zone
+    ob_border = "rgba(41, 98, 255, 0.65)"
+    fvg_color = "rgba(255, 193, 7, 0.15)"     # amber FVG zone
+    fvg_border = "rgba(255, 193, 7, 0.55)"
+    ote_color = "rgba(8, 153, 129, 0.15)" if bullish else "rgba(242, 54, 69, 0.15)"
+    ote_border = "rgba(8, 153, 129, 0.55)" if bullish else "rgba(242, 54, 69, 0.55)"
+
+    annotations = [
+        # --- Order Block zone ---
+        {
+            "drawTime": "beforeDatasetsDraw",
+            "type": "box",
+            "yScaleID": "yAxes",
+            "yMin": min(signal['ob_top'], signal['ob_bottom']),
+            "yMax": max(signal['ob_top'], signal['ob_bottom']),
+            "backgroundColor": ob_color,
+            "borderColor": ob_border,
+            "borderWidth": 1,
+            "label": {"content": "OB", "enabled": True, "position": "left", "fontColor": "#8fb8ff", "fontSize": 10}
+        },
+        # --- Fair Value Gap zone ---
+        {
+            "drawTime": "beforeDatasetsDraw",
+            "type": "box",
+            "yScaleID": "yAxes",
+            "yMin": min(signal['fvg_top'], signal['fvg_bottom']),
+            "yMax": max(signal['fvg_top'], signal['fvg_bottom']),
+            "backgroundColor": fvg_color,
+            "borderColor": fvg_border,
+            "borderWidth": 1,
+            "label": {"content": "FVG", "enabled": True, "position": "left", "fontColor": "#ffd76a", "fontSize": 10}
+        },
+        # --- Fib OTE zone (0.618 - 0.786) ---
+        {
+            "drawTime": "beforeDatasetsDraw",
+            "type": "box",
+            "yScaleID": "yAxes",
+            "yMin": min(signal['fib_618'], signal['fib_786']),
+            "yMax": max(signal['fib_618'], signal['fib_786']),
+            "backgroundColor": ote_color,
+            "borderColor": ote_border,
+            "borderWidth": 1,
+            "label": {"content": "OTE 0.618-0.786", "enabled": True, "position": "left", "fontColor": "#cfd8dc", "fontSize": 10}
+        },
+        # --- TP1 line ---
+        {
+            "type": "line", "mode": "horizontal", "scaleID": "yAxes",
+            "value": signal['tp1'], "borderColor": up_color if bullish else down_color,
+            "borderWidth": 2, "borderDash": [4, 4],
+            "label": {"content": f"TP1: {signal['tp1']}", "enabled": True, "position": "right",
+                      "backgroundColor": up_color if bullish else down_color}
+        },
+        # --- Entry 1 line ---
+        {
+            "type": "line", "mode": "horizontal", "scaleID": "yAxes",
+            "value": signal['entry1'], "borderColor": "#2962ff", "borderWidth": 2,
+            "label": {"content": f"Entry 1: {signal['entry1']}", "enabled": True, "position": "right",
+                      "backgroundColor": "#2962ff"}
+        },
+        # --- Entry 2 line ---
+        {
+            "type": "line", "mode": "horizontal", "scaleID": "yAxes",
+            "value": signal['entry2'], "borderColor": "#64b5f6", "borderWidth": 1, "borderDash": [2, 2],
+            "label": {"content": f"Entry 2: {signal['entry2']}", "enabled": True, "position": "right",
+                      "backgroundColor": "#64b5f6"}
+        },
+        # --- SL line ---
+        {
+            "type": "line", "mode": "horizontal", "scaleID": "yAxes",
+            "value": signal['sl'], "borderColor": down_color if bullish else up_color, "borderWidth": 2,
+            "borderDash": [4, 4],
+            "label": {"content": f"SL: {signal['sl']}", "enabled": True, "position": "right",
+                      "backgroundColor": down_color if bullish else up_color}
+        },
+    ]
+
     chart_config = {
         "type": "candlestick",
         "data": {
             "datasets": [{
-                "label": f"{signal['symbol']} 5M",
+                "label": f"{signal['symbol']} {signal['tf']}",
                 "data": chart_data,
-                "color": {
-                    "up": "#089981",
-                    "down": "#f23645",
-                    "unchanged": "#999999"
-                }
+                "color": {"up": up_color, "down": down_color, "unchanged": "#999999"}
             }]
         },
         "options": {
-            "backgroundColor": "#131722",
+            "backgroundColor": "#0b0f19",
             "legend": {"display": False},
+            "title": {
+                "display": True,
+                "text": f"{signal['symbol']} · {signal['tf']} · {signal['strategy']}",
+                "fontColor": "#e5e7eb",
+                "fontSize": 14
+            },
             "scales": {
                 "xAxes": [{"gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}],
-                "yAxes": [{"position": "right", "gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}]
+                "yAxes": [{"id": "yAxes", "position": "right",
+                           "gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}]
             },
             "plugins": {
-                "annotation": {
-                    "annotations": [
-                        {
-                            "type": "line",
-                            "mode": "horizontal",
-                            "scaleID": "yAxes",
-                            "value": signal['tp1'],
-                            "borderColor": "#089981",
-                            "borderWidth": 2,
-                            "borderDash": [4, 4],
-                            "label": {"content": f"TP1: {signal['tp1']}", "enabled": True, "position": "right"}
-                        },
-                        {
-                            "type": "line",
-                            "mode": "horizontal",
-                            "scaleID": "yAxes",
-                            "value": signal['entry1'],
-                            "borderColor": "#2962ff",
-                            "borderWidth": 2,
-                            "label": {"content": f"Entry 1: {signal['entry1']}", "enabled": True, "position": "right"}
-                        },
-                        {
-                            "type": "line",
-                            "mode": "horizontal",
-                            "scaleID": "yAxes",
-                            "value": signal['sl'],
-                            "borderColor": "#f23645",
-                            "borderWidth": 2,
-                            "borderDash": [4, 4],
-                            "label": {"content": f"SL: {signal['sl']}", "enabled": True, "position": "right"}
-                        }
-                    ]
-                }
+                "annotation": {"annotations": annotations}
             }
         }
     }
 
     url = "https://quickchart.io/chart"
     payload = {
-        "backgroundColor": "#131722",
-        "width": 900,
-        "height": 500,
+        "backgroundColor": "#0b0f19",
+        "width": 1000,
+        "height": 560,
         "format": "png",
         "version": "2.9.4",
         "chart": chart_config
     }
-    
+
     filename = f"chart_{signal['id_str']}_{int(time.time())}.png"
     filepath = os.path.join(CHARTS_DIR, filename)
 
     try:
-        res = requests.post(url, json=payload, timeout=12)
+        res = requests.post(url, json=payload, timeout=15)
         if res.status_code == 200:
             with open(filepath, 'wb') as f:
                 f.write(res.content)
             return filename, filepath
+        else:
+            print(f"QuickChart HTTP {res.status_code}: {res.text[:300]}")
     except Exception as e:
         print(f"QuickChart Candlestick Error: {e}")
-    
+
     return None, None
+
 
 def send_telegram_alert(signal, chart_path=None):
     if not BOT_CONFIG["broadcast"] or not BOT_CONFIG["bot_token"] or not BOT_CONFIG["channel"]:
         return None
-    
+
     msg = (
         f"⚡ <b>SMC SIGNAL {signal['id_str']} | {signal['symbol']} ({signal['tf']})</b>\n"
         f"<b>Strategy:</b> {signal['strategy']}\n"
         f"<b>Direction:</b> {signal['side']}\n\n"
+        f"🧱 <b>OB Zone:</b> {signal['ob_bottom']} - {signal['ob_top']}\n"
+        f"⚡ <b>FVG Zone:</b> {signal['fvg_bottom']} - {signal['fvg_top']}\n"
+        f"🎯 <b>OTE (0.618-0.786):</b> {signal['fib_786']} - {signal['fib_618']}\n\n"
         f"🎯 <b>ENTRY 1:</b> ${signal['entry1']:.2f}\n"
         f"🎯 <b>ENTRY 2:</b> ${signal['entry2']:.2f}\n"
         f"🛑 <b>SL:</b> ${signal['sl']:.2f}\n"
@@ -193,15 +333,18 @@ def send_telegram_alert(signal, chart_path=None):
         f"📊 <b>Risk:Reward:</b> 1:{signal['rr']}\n\n"
         f"🧱 <b>Status:</b> ACTIVE 🟢"
     )
-    
+
     url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendPhoto"
     try:
         if chart_path and os.path.exists(chart_path):
             with open(chart_path, 'rb') as photo:
-                res = requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=15)
+                res = requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'},
+                                     files={'photo': photo}, timeout=20)
                 res_json = res.json()
                 if res_json.get("ok"):
                     return res_json["result"]["message_id"]
+                else:
+                    print(f"Telegram sendPhoto failed: {res_json}")
         else:
             url_msg = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendMessage"
             res = requests.post(url_msg, data={'chat_id': BOT_CONFIG["channel"], 'text': msg, 'parse_mode': 'HTML'}, timeout=12)
@@ -212,10 +355,11 @@ def send_telegram_alert(signal, chart_path=None):
         print(f"TG Alert Error: {e}")
     return None
 
+
 def send_trade_update_reply(signal, update_status="WIN"):
     if not BOT_CONFIG["bot_token"] or not BOT_CONFIG["channel"] or not signal.get("tg_msg_id"):
         return
-    
+
     if update_status == "WIN":
         update_text = f"✅ <b>TARGET HIT (TP1) REACHED!</b> 🎉\nSignal {signal['id_str']} successfully secured profit! 🚀"
     else:
@@ -252,12 +396,12 @@ DASHBOARD_TEMPLATE = """
 </head>
 <body class="min-h-screen p-4 md:p-8">
     <div class="max-w-7xl mx-auto space-y-6">
-        
+
         <!-- Header -->
         <div class="flex flex-col md:flex-row justify-between items-center p-6 rounded-2xl lovable-card gap-4">
             <div>
                 <h1 class="text-3xl font-extrabold text-emerald-400">CryptoScalper AJ</h1>
-                <p class="text-xs text-gray-400 mt-1">SMC & Fib OTE Candlestick Engine with Telegram Reply System</p>
+                <p class="text-xs text-gray-400 mt-1">SMC (OB + FVG) & Fib OTE Candlestick Engine with Telegram Reply System</p>
             </div>
             <div class="text-right">
                 <p class="text-xs text-gray-400">Scanner Status</p>
@@ -304,7 +448,7 @@ DASHBOARD_TEMPLATE = """
                             <span class="font-bold text-white">{{ trade.symbol }} ({{ trade.tf }}) - <span class="text-emerald-400">{{ trade.side }}</span></span>
                             <span class="text-xs font-bold text-cyan-400 bg-cyan-950/60 px-2 py-1 rounded border border-cyan-800/40">{{ trade.id_str }}</span>
                         </div>
-                        
+
                         {% if trade.chart_img %}
                         <div class="w-full overflow-hidden rounded-lg border border-gray-800">
                             <img src="/charts/{{ trade.chart_img }}" class="w-full h-auto cursor-pointer" onclick="window.open('/charts/{{ trade.chart_img }}', '_blank')">
@@ -415,15 +559,17 @@ def home():
     stats = calculate_stats()
     return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
 
+
 @app.route('/charts/<filename>')
 def serve_chart(filename):
     return send_from_directory(CHARTS_DIR, filename)
+
 
 @app.route('/trigger-reply')
 def trigger_reply():
     sig_id = request.args.get("id")
     status = request.args.get("status")
-    
+
     for t in TRADE_HISTORY:
         if t["id_str"] == sig_id:
             t["status"] = status
@@ -431,12 +577,13 @@ def trigger_reply():
                 t["pnl"] = round((t["tp1"] - t["entry1"]) * 0.05, 2)
             else:
                 t["pnl"] = -round((t["entry1"] - t["sl"]) * 0.05, 2)
-            
+
             send_trade_update_reply(t, update_status=status)
             break
-            
+
     stats = calculate_stats()
     return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
+
 
 @app.route('/update-settings', methods=['POST'])
 def update_settings():
@@ -456,6 +603,7 @@ def update_settings():
 
     stats = calculate_stats()
     return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
