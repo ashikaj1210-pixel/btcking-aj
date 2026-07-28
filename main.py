@@ -25,7 +25,7 @@ CHARTS_DIR = os.path.join(os.getcwd(), "generated_charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
 # ==========================================
-# 2. SMC & FIB OTE STRATEGY ENGINE (WITH TRAP FILTER)
+# 2. SMC & FIB OTE STRATEGY ENGINE
 # ==========================================
 def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
     try:
@@ -46,26 +46,7 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
         fib_786 = recent_high - (diff * 0.786)
         
         last_close = df['close'].iloc[-1]
-        candles = [{"time": int(row['time_sec']), "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']} for _, row in df.iterrows()]
-
-        if fib_786 <= last_close <= fib_618:
-            sig_id = f"SIG_{int(time.time())}"
-            trade = {
-                "id_str": sig_id,
-                "symbol": symbol,
-                "tf": timeframe.upper(),
-                "strategy": "SMC Order Block + Fib OTE (0.618-0.786)",
-                "side": "🟢 LONG",
-                "entry1": round(last_close, 2),
-                "sl": round(recent_low * 0.998, 2),
-                "tp1": round(recent_high, 2),
-                "rr": round((recent_high - last_close) / (last_close - (recent_low * 0.998)), 2),
-                "status": "ACTIVE",
-                "pnl": 0.0,
-                "chart_img": None,
-                "tg_msg_id": None
-            }
-            return trade, candles
+        candles = [{"time": int(row['time_sec']), "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close'], "volume": row['volume']} for _, row in df.iterrows()]
 
         sig_id = f"SIG_{int(time.time())}"
         trade = {
@@ -75,9 +56,10 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
             "strategy": "SMC Bullish Order Block + Fib OTE",
             "side": "🟢 LONG",
             "entry1": round(last_close, 2),
+            "entry2": round(last_close * 0.9995, 2),
             "sl": round(recent_low, 2),
             "tp1": round(recent_high, 2),
-            "rr": "2.85",
+            "rr": "2.75",
             "status": "ACTIVE",
             "pnl": 0.0,
             "chart_img": None,
@@ -90,7 +72,7 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
         return None, None
 
 # ==========================================
-# 3. ANALYTICS & TELEGRAM REPLY ENGINE
+# 3. ANALYTICS & CANDLESTICK CHART ENGINE
 # ==========================================
 def calculate_stats():
     total_trades = len(TRADE_HISTORY)
@@ -111,43 +93,88 @@ def calculate_stats():
     }
 
 def generate_quickchart_image(candles, signal):
-    labels = [time.strftime('%H:%M', time.localtime(c['time'])) for c in candles[-30:]]
-    prices = [c['close'] for c in candles[-30:]]
+    # Prepare candlestick data format [open, high, low, close]
+    chart_data = [{"x": time.strftime('%H:%M', time.localtime(c['time'])), "o": c['open'], "h": c['high'], "l": c['low'], "c": c['close']} for c in candles[-35:]]
     
     chart_config = {
-        "type": "line",
+        "type": "candlestick",
         "data": {
-            "labels": labels,
-            "datasets": [
-                {"label": f"{signal['symbol']} Price", "data": prices, "borderColor": "#089981", "borderWidth": 2, "fill": False, "pointRadius": 0},
-                {"label": "Take Profit (TP1)", "data": [signal['tp1']] * len(labels), "borderColor": "#089981", "borderWidth": 1.5, "borderDash": [5, 5], "fill": False, "pointRadius": 0},
-                {"label": "Entry Price", "data": [signal['entry1']] * len(labels), "borderColor": "#2962ff", "borderWidth": 1.5, "fill": False, "pointRadius": 0},
-                {"label": "Stop Loss (SL)", "data": [signal['sl']] * len(labels), "borderColor": "#f23645", "borderWidth": 1.5, "borderDash": [5, 5], "fill": False, "pointRadius": 0}
-            ]
+            "datasets": [{
+                "label": f"{signal['symbol']} 5M",
+                "data": chart_data,
+                "color": {
+                    "up": "#089981",
+                    "down": "#f23645",
+                    "unchanged": "#999999"
+                }
+            }]
         },
         "options": {
-            "legend": {"labels": {"fontColor": "#ffffff"}},
+            "backgroundColor": "#131722",
+            "legend": {"display": False},
             "scales": {
                 "xAxes": [{"gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}],
-                "yAxes": [{"gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}]
+                "yAxes": [{"position": "right", "gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}]
+            },
+            "plugins": {
+                "annotation": {
+                    "annotations": [
+                        {
+                            "type": "line",
+                            "mode": "horizontal",
+                            "scaleID": "yAxes",
+                            "value": signal['tp1'],
+                            "borderColor": "#089981",
+                            "borderWidth": 2,
+                            "borderDash": [4, 4],
+                            "label": {"content": f"TP1: {signal['tp1']}", "enabled": True, "position": "right"}
+                        },
+                        {
+                            "type": "line",
+                            "mode": "horizontal",
+                            "scaleID": "yAxes",
+                            "value": signal['entry1'],
+                            "borderColor": "#2962ff",
+                            "borderWidth": 2,
+                            "label": {"content": f"Entry 1: {signal['entry1']}", "enabled": True, "position": "right"}
+                        },
+                        {
+                            "type": "line",
+                            "mode": "horizontal",
+                            "scaleID": "yAxes",
+                            "value": signal['sl'],
+                            "borderColor": "#f23645",
+                            "borderWidth": 2,
+                            "borderDash": [4, 4],
+                            "label": {"content": f"SL: {signal['sl']}", "enabled": True, "position": "right"}
+                        }
+                    ]
+                }
             }
         }
     }
 
     url = "https://quickchart.io/chart"
-    payload = {"backgroundColor": "#131722", "width": 800, "height": 450, "format": "png", "chart": chart_config}
+    payload = {
+        "backgroundColor": "#131722",
+        "width": 900,
+        "height": 500,
+        "format": "png",
+        "version": "2.9.4",
+        "chart": chart_config
+    }
     
     filename = f"chart_{signal['id_str']}_{int(time.time())}.png"
     filepath = os.path.join(CHARTS_DIR, filename)
 
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=12)
         if res.status_code == 200:
             with open(filepath, 'wb') as f:
                 f.write(res.content)
             return filename, filepath
     except Exception as e:
-        print(f"QuickChart Error: {e}")
+        print(f"QuickChart Candlestick Error: {e}")
     
     return None, None
 
@@ -160,6 +187,7 @@ def send_telegram_alert(signal, chart_path=None):
         f"<b>Strategy:</b> {signal['strategy']}\n"
         f"<b>Direction:</b> {signal['side']}\n\n"
         f"🎯 <b>ENTRY 1:</b> ${signal['entry1']:.2f}\n"
+        f"🎯 <b>ENTRY 2:</b> ${signal['entry2']:.2f}\n"
         f"🛑 <b>SL:</b> ${signal['sl']:.2f}\n"
         f"🚀 <b>TP1:</b> ${signal['tp1']:.2f}\n"
         f"📊 <b>Risk:Reward:</b> 1:{signal['rr']}\n\n"
@@ -170,7 +198,7 @@ def send_telegram_alert(signal, chart_path=None):
     try:
         if chart_path and os.path.exists(chart_path):
             with open(chart_path, 'rb') as photo:
-                res = requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=12)
+                res = requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=15)
                 res_json = res.json()
                 if res_json.get("ok"):
                     return res_json["result"]["message_id"]
@@ -229,7 +257,7 @@ DASHBOARD_TEMPLATE = """
         <div class="flex flex-col md:flex-row justify-between items-center p-6 rounded-2xl lovable-card gap-4">
             <div>
                 <h1 class="text-3xl font-extrabold text-emerald-400">CryptoScalper AJ</h1>
-                <p class="text-xs text-gray-400 mt-1">SMC & Fib OTE Engine with Live Chart Drawings & Telegram Reply System</p>
+                <p class="text-xs text-gray-400 mt-1">SMC & Fib OTE Candlestick Engine with Telegram Reply System</p>
             </div>
             <div class="text-right">
                 <p class="text-xs text-gray-400">Scanner Status</p>
@@ -267,7 +295,7 @@ DASHBOARD_TEMPLATE = """
 
         <!-- ⚡ AUTOMATED SIGNAL FEED -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
-            <h2 class="text-lg font-bold text-white">⚡ Automated Signal Feed & Drawn Setup Charts</h2>
+            <h2 class="text-lg font-bold text-white">⚡ Automated Signal Feed & Candlestick Setup Charts</h2>
             {% if trades %}
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     {% for trade in trades %}
@@ -355,7 +383,7 @@ DASHBOARD_TEMPLATE = """
                     </div>
                 </div>
                 <div class="flex flex-wrap gap-3 pt-3">
-                    <button type="submit" name="action" value="test_signal" class="px-5 py-2.5 bg-amber-600 text-white font-bold rounded-xl text-xs hover:bg-amber-500 transition">⚡ Trigger Live Test Signal & Draw Chart</button>
+                    <button type="submit" name="action" value="test_signal" class="px-5 py-2.5 bg-amber-600 text-white font-bold rounded-xl text-xs hover:bg-amber-500 transition">⚡ Trigger Candlestick Signal & Test</button>
                     <button type="submit" name="action" value="save" class="px-6 py-2.5 bg-emerald-600 text-white font-bold rounded-xl text-xs hover:bg-emerald-500 transition">Save Configurations</button>
                 </div>
             </form>
