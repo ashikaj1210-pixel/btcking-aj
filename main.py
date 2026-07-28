@@ -1,5 +1,7 @@
 import os
+import json
 import time
+import threading
 import requests
 import ccxt
 import pandas as pd
@@ -16,44 +18,77 @@ BOT_CONFIG = {
     "mexc_key": os.getenv("MEXC_API_KEY", ""),
     "mexc_secret": os.getenv("MEXC_SECRET_KEY", ""),
     "broadcast": True,
-    "autotrade": False
+    "autotrade": False,          # acts as "auto-scan enabled" toggle
+    "symbols": ["BTC/USDT"],     # symbols the scanner loop watches
+    "timeframe": "5m",
+    "scan_interval": 300         # seconds between auto-scans
 }
 
 TRADE_HISTORY = []
+STATE_LOCK = threading.Lock()
 
 CHARTS_DIR = os.path.join(os.getcwd(), "generated_charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
+
+DATA_DIR = os.path.join(os.getcwd(), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+
+
+def load_state():
+    """Restore config + trade history from disk so a restart doesn't wipe everything."""
+    global BOT_CONFIG, TRADE_HISTORY
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+            BOT_CONFIG.update(data.get("config", BOT_CONFIG))
+            TRADE_HISTORY.extend(data.get("trades", []))
+            print(f"State restored: {len(TRADE_HISTORY)} trades loaded.")
+        except Exception as e:
+            print(f"State load error: {e}")
+
+
+def save_state():
+    """Persist config + trade history to disk. Call this after any mutation."""
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump({"config": BOT_CONFIG, "trades": TRADE_HISTORY}, f)
+    except Exception as e:
+        print(f"State save error: {e}")
+
+
+def get_mexc_client():
+    return ccxt.mexc({
+        'apiKey': BOT_CONFIG.get('mexc_key', ''),
+        'secret': BOT_CONFIG.get('mexc_secret', ''),
+        'options': {'defaultType': 'swap'}
+    })
 
 # ==========================================
 # 2. SMC & FIB OTE STRATEGY ENGINE
 # ==========================================
 def find_order_block(df_slice, bullish=True):
     """
-    Very simple OB detector:
+    Simple OB detector:
     - Bullish OB = last down (red) candle before the impulsive up move.
     - Bearish OB = last up (green) candle before the impulsive down move.
     Falls back to the extreme candle itself if none is found.
     """
     if bullish:
         down = df_slice[df_slice['close'] < df_slice['open']]
-        if not down.empty:
-            c = down.iloc[-1]
-        else:
-            c = df_slice.iloc[0]
+        c = down.iloc[-1] if not down.empty else df_slice.iloc[0]
     else:
         up = df_slice[df_slice['close'] > df_slice['open']]
-        if not up.empty:
-            c = up.iloc[-1]
-        else:
-            c = df_slice.iloc[0]
+        c = up.iloc[-1] if not up.empty else df_slice.iloc[0]
     return float(c['high']), float(c['low'])
 
 
 def find_fvg(df_slice, bullish=True):
     """
     3-candle Fair Value Gap detector.
-    Bullish FVG: candle[i-1].high < candle[i+1].low  -> gap between them.
-    Bearish FVG: candle[i-1].low  > candle[i+1].high -> gap between them.
+    Bullish FVG: candle[i-1].high < candle[i+1].low
+    Bearish FVG: candle[i-1].low  > candle[i+1].high
     Returns the most recent gap found, or None.
     """
     rows = df_slice.reset_index(drop=True)
@@ -70,7 +105,7 @@ def find_fvg(df_slice, bullish=True):
 
 def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
     try:
-        mexc = ccxt.mexc({'options': {'defaultType': 'swap'}})
+        mexc = get_mexc_client()
         ohlcv = mexc.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
 
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
@@ -86,14 +121,13 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
 
         low_idx = int(last30['low'].idxmin())
         high_idx = int(last30['high'].idxmax())
-        bullish = high_idx > low_idx  # impulse direction used for the setup
+        bullish = high_idx > low_idx
 
         fib_618 = recent_high - (diff * 0.618)
         fib_786 = recent_high - (diff * 0.786)
 
         last_close = df['close'].iloc[-1]
 
-        # --- Order Block ---
         if bullish:
             ob_slice = last30.iloc[max(0, low_idx - 3): low_idx + 1]
             ob_top, ob_bottom = find_order_block(ob_slice, bullish=True)
@@ -101,13 +135,12 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
             ob_slice = last30.iloc[max(0, high_idx - 3): high_idx + 1]
             ob_top, ob_bottom = find_order_block(ob_slice, bullish=False)
 
-        # --- Fair Value Gap ---
         move_slice = last30.iloc[min(low_idx, high_idx): max(low_idx, high_idx) + 1]
         fvg = find_fvg(move_slice, bullish=bullish)
         if fvg:
             fvg_bottom, fvg_top = fvg
         else:
-            fvg_bottom, fvg_top = fib_786, fib_618  # fallback to the OTE band
+            fvg_bottom, fvg_top = fib_786, fib_618
 
         candles = [{"time": int(row['time_sec']), "open": row['open'], "high": row['high'],
                     "low": row['low'], "close": row['close'], "volume": row['volume']}
@@ -167,12 +200,8 @@ def calculate_stats():
 
 def generate_quickchart_image(candles, signal):
     """
-    Renders a dark, TradingView-style candlestick chart with:
-      - Order Block zone (box)
-      - Fair Value Gap zone (box)
-      - Fib 0.618/0.786 OTE zone (box)
-      - Entry / SL / TP horizontal lines with labels
-    via quickchart.io (chart.js 2.9.4 + chartjs-chart-financial + chartjs-plugin-annotation).
+    Dark, TradingView-style candlestick chart with OB zone, FVG zone,
+    Fib 0.618/0.786 OTE zone, and Entry/SL/TP lines, via quickchart.io.
     """
     visible = candles[-45:]
     chart_data = [{
@@ -183,51 +212,35 @@ def generate_quickchart_image(candles, signal):
     bullish = signal.get("trend_bullish", True)
     up_color = "#089981"
     down_color = "#f23645"
-    ob_color = "rgba(41, 98, 255, 0.18)"      # blue-ish OB zone
+    ob_color = "rgba(41, 98, 255, 0.18)"
     ob_border = "rgba(41, 98, 255, 0.65)"
-    fvg_color = "rgba(255, 193, 7, 0.15)"     # amber FVG zone
+    fvg_color = "rgba(255, 193, 7, 0.15)"
     fvg_border = "rgba(255, 193, 7, 0.55)"
     ote_color = "rgba(8, 153, 129, 0.15)" if bullish else "rgba(242, 54, 69, 0.15)"
     ote_border = "rgba(8, 153, 129, 0.55)" if bullish else "rgba(242, 54, 69, 0.55)"
 
     annotations = [
-        # --- Order Block zone ---
         {
-            "drawTime": "beforeDatasetsDraw",
-            "type": "box",
-            "yScaleID": "yAxes",
+            "drawTime": "beforeDatasetsDraw", "type": "box", "yScaleID": "yAxes",
             "yMin": min(signal['ob_top'], signal['ob_bottom']),
             "yMax": max(signal['ob_top'], signal['ob_bottom']),
-            "backgroundColor": ob_color,
-            "borderColor": ob_border,
-            "borderWidth": 1,
+            "backgroundColor": ob_color, "borderColor": ob_border, "borderWidth": 1,
             "label": {"content": "OB", "enabled": True, "position": "left", "fontColor": "#8fb8ff", "fontSize": 10}
         },
-        # --- Fair Value Gap zone ---
         {
-            "drawTime": "beforeDatasetsDraw",
-            "type": "box",
-            "yScaleID": "yAxes",
+            "drawTime": "beforeDatasetsDraw", "type": "box", "yScaleID": "yAxes",
             "yMin": min(signal['fvg_top'], signal['fvg_bottom']),
             "yMax": max(signal['fvg_top'], signal['fvg_bottom']),
-            "backgroundColor": fvg_color,
-            "borderColor": fvg_border,
-            "borderWidth": 1,
+            "backgroundColor": fvg_color, "borderColor": fvg_border, "borderWidth": 1,
             "label": {"content": "FVG", "enabled": True, "position": "left", "fontColor": "#ffd76a", "fontSize": 10}
         },
-        # --- Fib OTE zone (0.618 - 0.786) ---
         {
-            "drawTime": "beforeDatasetsDraw",
-            "type": "box",
-            "yScaleID": "yAxes",
+            "drawTime": "beforeDatasetsDraw", "type": "box", "yScaleID": "yAxes",
             "yMin": min(signal['fib_618'], signal['fib_786']),
             "yMax": max(signal['fib_618'], signal['fib_786']),
-            "backgroundColor": ote_color,
-            "borderColor": ote_border,
-            "borderWidth": 1,
+            "backgroundColor": ote_color, "borderColor": ote_border, "borderWidth": 1,
             "label": {"content": "OTE 0.618-0.786", "enabled": True, "position": "left", "fontColor": "#cfd8dc", "fontSize": 10}
         },
-        # --- TP1 line ---
         {
             "type": "line", "mode": "horizontal", "scaleID": "yAxes",
             "value": signal['tp1'], "borderColor": up_color if bullish else down_color,
@@ -235,21 +248,18 @@ def generate_quickchart_image(candles, signal):
             "label": {"content": f"TP1: {signal['tp1']}", "enabled": True, "position": "right",
                       "backgroundColor": up_color if bullish else down_color}
         },
-        # --- Entry 1 line ---
         {
             "type": "line", "mode": "horizontal", "scaleID": "yAxes",
             "value": signal['entry1'], "borderColor": "#2962ff", "borderWidth": 2,
             "label": {"content": f"Entry 1: {signal['entry1']}", "enabled": True, "position": "right",
                       "backgroundColor": "#2962ff"}
         },
-        # --- Entry 2 line ---
         {
             "type": "line", "mode": "horizontal", "scaleID": "yAxes",
             "value": signal['entry2'], "borderColor": "#64b5f6", "borderWidth": 1, "borderDash": [2, 2],
             "label": {"content": f"Entry 2: {signal['entry2']}", "enabled": True, "position": "right",
                       "backgroundColor": "#64b5f6"}
         },
-        # --- SL line ---
         {
             "type": "line", "mode": "horizontal", "scaleID": "yAxes",
             "value": signal['sl'], "borderColor": down_color if bullish else up_color, "borderWidth": 2,
@@ -274,28 +284,21 @@ def generate_quickchart_image(candles, signal):
             "title": {
                 "display": True,
                 "text": f"{signal['symbol']} · {signal['tf']} · {signal['strategy']}",
-                "fontColor": "#e5e7eb",
-                "fontSize": 14
+                "fontColor": "#e5e7eb", "fontSize": 14
             },
             "scales": {
                 "xAxes": [{"gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}],
                 "yAxes": [{"id": "yAxes", "position": "right",
                            "gridLines": {"color": "#1f2937"}, "ticks": {"fontColor": "#848e9c"}}]
             },
-            "plugins": {
-                "annotation": {"annotations": annotations}
-            }
+            "plugins": {"annotation": {"annotations": annotations}}
         }
     }
 
     url = "https://quickchart.io/chart"
     payload = {
-        "backgroundColor": "#0b0f19",
-        "width": 1000,
-        "height": 560,
-        "format": "png",
-        "version": "2.9.4",
-        "chart": chart_config
+        "backgroundColor": "#0b0f19", "width": 1000, "height": 560,
+        "format": "png", "version": "2.9.4", "chart": chart_config
     }
 
     filename = f"chart_{signal['id_str']}_{int(time.time())}.png"
@@ -367,10 +370,8 @@ def send_trade_update_reply(signal, update_status="WIN"):
 
     url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendMessage"
     payload = {
-        'chat_id': BOT_CONFIG["channel"],
-        'text': update_text,
-        'parse_mode': 'HTML',
-        'reply_to_message_id': signal["tg_msg_id"]
+        'chat_id': BOT_CONFIG["channel"], 'text': update_text,
+        'parse_mode': 'HTML', 'reply_to_message_id': signal["tg_msg_id"]
     }
     try:
         requests.post(url, data=payload, timeout=10)
@@ -378,7 +379,73 @@ def send_trade_update_reply(signal, update_status="WIN"):
         print(f"Reply Update Error: {e}")
 
 # ==========================================
-# 4. DASHBOARD UI TEMPLATE
+# 4. BACKGROUND WORKERS (auto-scan + auto TP/SL monitor)
+# ==========================================
+def scanner_loop():
+    """Runs forever. When autotrade (auto-scan) is on, periodically scans the
+    configured symbols and fires a new signal if that symbol has no ACTIVE trade."""
+    while True:
+        try:
+            if BOT_CONFIG.get("autotrade"):
+                symbols = BOT_CONFIG.get("symbols", ["BTC/USDT"])
+                tf = BOT_CONFIG.get("timeframe", "5m")
+                for sym in symbols:
+                    with STATE_LOCK:
+                        has_active = any(t["symbol"] == sym and t["status"] == "ACTIVE" for t in TRADE_HISTORY)
+                    if has_active:
+                        continue
+                    trade, candles = analyze_smc_fib_strategy(sym, tf)
+                    if trade and candles:
+                        img_name, img_path = generate_quickchart_image(candles, trade)
+                        trade["chart_img"] = img_name
+                        msg_id = send_telegram_alert(trade, img_path)
+                        trade["tg_msg_id"] = msg_id
+                        with STATE_LOCK:
+                            TRADE_HISTORY.insert(0, trade)
+                            save_state()
+                        print(f"[scanner] New {trade['side']} signal for {sym}")
+        except Exception as e:
+            print(f"Scanner loop error: {e}")
+        time.sleep(max(30, int(BOT_CONFIG.get("scan_interval", 300))))
+
+
+def monitor_loop():
+    """Runs forever. Polls live price for every ACTIVE trade and auto-closes
+    it as WIN/LOSS when TP1 or SL is hit, then sends the Telegram reply."""
+    while True:
+        try:
+            with STATE_LOCK:
+                active_trades = [t for t in TRADE_HISTORY if t["status"] == "ACTIVE"]
+            if active_trades:
+                mexc = get_mexc_client()
+                for t in active_trades:
+                    try:
+                        ticker = mexc.fetch_ticker(t["symbol"])
+                        price = ticker.get("last")
+                        if price is None:
+                            continue
+                        is_long = "LONG" in t["side"]
+                        hit_tp = price >= t["tp1"] if is_long else price <= t["tp1"]
+                        hit_sl = price <= t["sl"] if is_long else price >= t["sl"]
+                        if hit_tp or hit_sl:
+                            status = "WIN" if hit_tp else "LOSS"
+                            with STATE_LOCK:
+                                t["status"] = status
+                                if status == "WIN":
+                                    t["pnl"] = round(abs(t["tp1"] - t["entry1"]) * 0.05, 2)
+                                else:
+                                    t["pnl"] = -round(abs(t["entry1"] - t["sl"]) * 0.05, 2)
+                                save_state()
+                            send_trade_update_reply(t, update_status=status)
+                            print(f"[monitor] {t['id_str']} closed as {status}")
+                    except Exception as e:
+                        print(f"Monitor ticker error for {t['symbol']}: {e}")
+        except Exception as e:
+            print(f"Monitor loop error: {e}")
+        time.sleep(20)
+
+# ==========================================
+# 5. DASHBOARD UI TEMPLATE
 # ==========================================
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
@@ -404,8 +471,10 @@ DASHBOARD_TEMPLATE = """
                 <p class="text-xs text-gray-400 mt-1">SMC (OB + FVG) & Fib OTE Candlestick Engine with Telegram Reply System</p>
             </div>
             <div class="text-right">
-                <p class="text-xs text-gray-400">Scanner Status</p>
-                <p class="text-sm font-semibold text-emerald-400">Active & Scanning</p>
+                <p class="text-xs text-gray-400">Auto-Scan</p>
+                <p class="text-sm font-semibold {% if config.autotrade %}text-emerald-400{% else %}text-gray-500{% endif %}">
+                    {% if config.autotrade %}ON · every {{ config.scan_interval }}s{% else %}OFF{% endif %}
+                </p>
             </div>
         </div>
 
@@ -465,7 +534,7 @@ DASHBOARD_TEMPLATE = """
                 </div>
             {% else %}
                 <div class="text-center py-8 text-gray-500 text-sm">
-                    No active signal generated yet. Click "Trigger Live Test Signal" below to test.
+                    No active signal generated yet. Click "Trigger Live Test Signal" below, or turn Auto-Scan on.
                 </div>
             {% endif %}
         </div>
@@ -473,6 +542,7 @@ DASHBOARD_TEMPLATE = """
         <!-- 📋 TRADE PERFORMANCE HISTORY & TELEGRAM REPLY -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
             <h2 class="text-lg font-bold text-white">📋 Trade Performance & Telegram Reply Control</h2>
+            <p class="text-[11px] text-gray-500">TP/SL are also monitored automatically in the background — these buttons are for manual override.</p>
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs text-gray-300">
                     <thead class="bg-gray-800/60 text-gray-400 uppercase font-bold">
@@ -482,7 +552,7 @@ DASHBOARD_TEMPLATE = """
                             <th class="p-3">Type</th>
                             <th class="p-3">Entry</th>
                             <th class="p-3">Status</th>
-                            <th class="p-3">Trigger Reply on Telegram</th>
+                            <th class="p-3">Manual Override</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-800">
@@ -501,9 +571,19 @@ DASHBOARD_TEMPLATE = """
                                     <span class="bg-amber-950 text-amber-400 border border-amber-800 px-2 py-0.5 rounded font-bold">ACTIVE</span>
                                 {% endif %}
                             </td>
-                            <td class="p-3 flex gap-2">
-                                <a href="/trigger-reply?id={{ t.id_str }}&status=WIN" class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded font-bold text-[10px]">Reply TP Hit ✅</a>
-                                <a href="/trigger-reply?id={{ t.id_str }}&status=LOSS" class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded font-bold text-[10px]">Reply SL Hit ❌</a>
+                            <td class="p-3">
+                                <div class="flex gap-2">
+                                    <form method="POST" action="/trigger-reply">
+                                        <input type="hidden" name="id" value="{{ t.id_str }}">
+                                        <input type="hidden" name="status" value="WIN">
+                                        <button type="submit" class="bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded font-bold text-[10px]">TP Hit ✅</button>
+                                    </form>
+                                    <form method="POST" action="/trigger-reply">
+                                        <input type="hidden" name="id" value="{{ t.id_str }}">
+                                        <input type="hidden" name="status" value="LOSS">
+                                        <button type="submit" class="bg-rose-700 hover:bg-rose-600 text-white px-2.5 py-1 rounded font-bold text-[10px]">SL Hit ❌</button>
+                                    </form>
+                                </div>
                             </td>
                         </tr>
                         {% endfor %}
@@ -514,7 +594,7 @@ DASHBOARD_TEMPLATE = """
 
         <!-- ⚙️ CONFIGURATIONS -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
-            <h2 class="text-lg font-bold text-white">⚙️ API & Configurations</h2>
+            <h2 class="text-lg font-bold text-white">⚙️ API & Scanner Configurations</h2>
             <form action="/update-settings" method="POST" class="space-y-4">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
@@ -524,6 +604,34 @@ DASHBOARD_TEMPLATE = """
                     <div>
                         <label class="text-xs text-gray-400">TELEGRAM_CHANNEL_USERNAME</label>
                         <input type="text" name="channel" value="{{ config.channel }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400">MEXC_API_KEY</label>
+                        <input type="password" name="mexc_key" value="{{ config.mexc_key }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400">MEXC_SECRET_KEY</label>
+                        <input type="password" name="mexc_secret" value="{{ config.mexc_secret }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400">SYMBOLS (comma-separated)</label>
+                        <input type="text" name="symbols" value="{{ config.symbols|join(', ') }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400">TIMEFRAME</label>
+                        <select name="timeframe" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
+                            {% for tf in ['1m','5m','15m','1h'] %}
+                            <option value="{{ tf }}" {% if config.timeframe == tf %}selected{% endif %}>{{ tf }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-400">SCAN INTERVAL (seconds, min 30)</label>
+                        <input type="number" min="30" name="scan_interval" value="{{ config.scan_interval }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
+                    </div>
+                    <div class="flex items-center gap-2 mt-5">
+                        <input type="checkbox" id="autotrade" name="autotrade" {% if config.autotrade %}checked{% endif %} class="w-4 h-4">
+                        <label for="autotrade" class="text-xs text-gray-300">Enable Auto-Scan (background signal generation)</label>
                     </div>
                 </div>
                 <div class="flex flex-wrap gap-3 pt-3">
@@ -552,7 +660,7 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ==========================================
-# 5. FLASK SERVER ROUTES
+# 6. FLASK SERVER ROUTES
 # ==========================================
 @app.route('/')
 def home():
@@ -565,21 +673,22 @@ def serve_chart(filename):
     return send_from_directory(CHARTS_DIR, filename)
 
 
-@app.route('/trigger-reply')
+@app.route('/trigger-reply', methods=['POST'])
 def trigger_reply():
-    sig_id = request.args.get("id")
-    status = request.args.get("status")
+    sig_id = request.form.get("id")
+    status = request.form.get("status")
 
-    for t in TRADE_HISTORY:
-        if t["id_str"] == sig_id:
-            t["status"] = status
-            if status == "WIN":
-                t["pnl"] = round((t["tp1"] - t["entry1"]) * 0.05, 2)
-            else:
-                t["pnl"] = -round((t["entry1"] - t["sl"]) * 0.05, 2)
-
-            send_trade_update_reply(t, update_status=status)
-            break
+    with STATE_LOCK:
+        for t in TRADE_HISTORY:
+            if t["id_str"] == sig_id:
+                t["status"] = status
+                if status == "WIN":
+                    t["pnl"] = round(abs(t["tp1"] - t["entry1"]) * 0.05, 2)
+                else:
+                    t["pnl"] = -round(abs(t["entry1"] - t["sl"]) * 0.05, 2)
+                save_state()
+                send_trade_update_reply(t, update_status=status)
+                break
 
     stats = calculate_stats()
     return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
@@ -590,21 +699,42 @@ def update_settings():
     action = request.form.get("action")
     BOT_CONFIG["bot_token"] = request.form.get("bot_token", "").strip()
     BOT_CONFIG["channel"] = request.form.get("channel", "").strip()
+    BOT_CONFIG["mexc_key"] = request.form.get("mexc_key", "").strip()
+    BOT_CONFIG["mexc_secret"] = request.form.get("mexc_secret", "").strip()
     BOT_CONFIG["broadcast"] = True
 
+    symbols_raw = request.form.get("symbols", "BTC/USDT")
+    BOT_CONFIG["symbols"] = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+    BOT_CONFIG["timeframe"] = request.form.get("timeframe", "5m")
+    try:
+        BOT_CONFIG["scan_interval"] = max(30, int(request.form.get("scan_interval", 300)))
+    except ValueError:
+        BOT_CONFIG["scan_interval"] = 300
+    BOT_CONFIG["autotrade"] = request.form.get("autotrade") == "on"
+
     if action == "test_signal":
-        trade, candles = analyze_smc_fib_strategy('BTC/USDT', '5m')
+        sym = BOT_CONFIG["symbols"][0] if BOT_CONFIG["symbols"] else "BTC/USDT"
+        trade, candles = analyze_smc_fib_strategy(sym, BOT_CONFIG["timeframe"])
         if trade and candles:
             img_name, img_path = generate_quickchart_image(candles, trade)
             trade["chart_img"] = img_name
             msg_id = send_telegram_alert(trade, img_path)
             trade["tg_msg_id"] = msg_id
-            TRADE_HISTORY.insert(0, trade)
+            with STATE_LOCK:
+                TRADE_HISTORY.insert(0, trade)
+
+    with STATE_LOCK:
+        save_state()
 
     stats = calculate_stats()
     return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
 
 
+# Restore saved state as soon as the module loads (works under gunicorn too)
+load_state()
+
 if __name__ == '__main__':
+    threading.Thread(target=scanner_loop, daemon=True).start()
+    threading.Thread(target=monitor_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
