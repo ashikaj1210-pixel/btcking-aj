@@ -32,7 +32,7 @@ STATS = {
 
 ACTIVE_TRADES = []
 
-# Embedded HTML Template
+# Embedded HTML Template with Chart, Signal Table & Test Buttons
 HTML_LAYOUT = """
 <!DOCTYPE html>
 <html lang="en">
@@ -49,6 +49,7 @@ HTML_LAYOUT = """
 <body class="p-4 md:p-8">
     <div class="max-w-5xl mx-auto space-y-6">
         
+        <!-- Header -->
         <div class="flex items-center justify-between card p-5 rounded-2xl">
             <div>
                 <h1 class="text-2xl font-bold text-emerald-400">CryptoScalper AJ</h1>
@@ -59,6 +60,7 @@ HTML_LAYOUT = """
             </span>
         </div>
 
+        <!-- Metrics Cards -->
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div class="card p-4 rounded-xl"><p class="text-xs text-gray-400">Total Signals</p><p class="text-2xl font-bold mt-1 text-white">{{ stats.total_signals }}</p></div>
             <div class="card p-4 rounded-xl"><p class="text-xs text-gray-400">Win Rate</p><p class="text-2xl font-bold mt-1 text-emerald-400">{{ stats.win_rate }}%</p></div>
@@ -66,6 +68,50 @@ HTML_LAYOUT = """
             <div class="card p-4 rounded-xl"><p class="text-xs text-gray-400">Active Signals</p><p class="text-2xl font-bold mt-1 text-amber-400">{{ stats.active_signals }}</p></div>
         </div>
 
+        <!-- Live TradingView Chart Widget -->
+        <div class="card p-5 rounded-xl space-y-3">
+            <h2 class="text-lg font-bold text-white flex items-center gap-2">📈 Live BTC/USDT Chart</h2>
+            <div class="w-full rounded-lg overflow-hidden border border-gray-800" style="height: 480px;">
+                <div id="tradingview_chart" class="w-full h-full"></div>
+            </div>
+        </div>
+
+        <!-- Active Signals & Report Table -->
+        <div class="card p-5 rounded-xl space-y-3">
+            <h2 class="text-lg font-bold text-white flex items-center gap-2">📜 Signal Report & History</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm text-gray-300">
+                    <thead class="bg-gray-800/60 text-xs text-gray-400 uppercase">
+                        <tr>
+                            <th class="p-3">Symbol</th>
+                            <th class="p-3">Direction</th>
+                            <th class="p-3">Entry Price</th>
+                            <th class="p-3">Stop Loss (SL)</th>
+                            <th class="p-3">Take Profit (TP)</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-800">
+                        {% if trades %}
+                            {% for trade in trades %}
+                            <tr class="hover:bg-gray-800/30">
+                                <td class="p-3 font-semibold text-white">{{ trade.symbol }}</td>
+                                <td class="p-3 text-emerald-400 font-bold">{{ trade.side }}</td>
+                                <td class="p-3">${{ "%.2f"|format(trade.entry) }}</td>
+                                <td class="p-3 text-rose-400">${{ "%.2f"|format(trade.sl) }}</td>
+                                <td class="p-3 text-emerald-400">${{ "%.2f"|format(trade.tp2) }}</td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            <tr>
+                                <td colspan="5" class="p-4 text-center text-xs text-gray-500">No active signals generated yet. Scanner is searching...</td>
+                            </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Control Panel -->
         <div class="card p-6 rounded-xl space-y-4">
             <h2 class="text-lg font-bold text-white">⚙️ Control Panel</h2>
             <form action="/update-settings" method="POST" class="space-y-4">
@@ -79,14 +125,32 @@ HTML_LAYOUT = """
                     <label class="flex items-center gap-2 text-sm"><input type="checkbox" name="broadcast" {% if config.broadcast %}checked{% endif %}> Signal Broadcast</label>
                     <label class="flex items-center gap-2 text-sm"><input type="checkbox" name="autotrade" {% if config.autotrade %}checked{% endif %}> Auto Trading</label>
                 </div>
-                <div class="flex gap-3">
-                    <button type="submit" name="action" value="test_tg" class="px-4 py-2 bg-gray-800 text-white font-bold rounded text-xs">Test Telegram</button>
-                    <button type="submit" name="action" value="save" class="px-6 py-2 bg-emerald-600 text-white font-bold rounded text-xs">Save Settings</button>
+                <div class="flex flex-wrap gap-3 pt-2">
+                    <button type="submit" name="action" value="test_tg" class="px-4 py-2 bg-gray-800 text-white font-bold rounded text-xs hover:bg-gray-700">Test Telegram</button>
+                    <button type="submit" name="action" value="test_signal" class="px-4 py-2 bg-amber-600 text-white font-bold rounded text-xs hover:bg-amber-500">⚡ Send Test Signal</button>
+                    <button type="submit" name="action" value="save" class="px-6 py-2 bg-emerald-600 text-white font-bold rounded text-xs hover:bg-emerald-500">Save Settings</button>
                 </div>
             </form>
         </div>
 
     </div>
+
+    <!-- TradingView Script -->
+    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+    <script type="text/javascript">
+    new TradingView.widget({
+      "autosize": true,
+      "symbol": "MEXC:BTCUSDT",
+      "interval": "15",
+      "timezone": "Etc/UTC",
+      "theme": "dark",
+      "style": "1",
+      "locale": "en",
+      "enable_publishing": false,
+      "hide_side_toolbar": false,
+      "container_id": "tradingview_chart"
+    });
+    </script>
 </body>
 </html>
 """
@@ -111,16 +175,20 @@ def generate_dark_chart(df, signal):
     plt.close()
     return chart_path
 
-def send_telegram_alert(signal, chart_path):
+def send_telegram_alert(signal, chart_path=None):
     if not BOT_CONFIG["broadcast"] or not BOT_CONFIG["bot_token"] or not BOT_CONFIG["channel"]:
         return
     msg = f"⚡ <b>SIGNAL | {signal['symbol']}</b>\nDirection: {signal['side']}\nENTRY: ${signal['entry']:.2f}\nSL: ${signal['sl']:.2f}\nTP: ${signal['tp2']:.2f}"
-    url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendPhoto"
-    try:
-        with open(chart_path, 'rb') as photo:
-            requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=10)
-    except Exception as e:
-        print(f"TG Error: {e}")
+    
+    if chart_path and os.path.exists(chart_path):
+        url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendPhoto"
+        try:
+            with open(chart_path, 'rb') as photo:
+                requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=10)
+        except Exception as e:
+            print(f"TG Error: {e}")
+    else:
+        send_telegram_reply(msg)
 
 def send_telegram_reply(text):
     if not BOT_CONFIG["broadcast"] or not BOT_CONFIG["bot_token"] or not BOT_CONFIG["channel"]:
@@ -172,7 +240,7 @@ threading.Thread(target=run_trading_scanner, daemon=True).start()
 # Web Routes
 @app.route('/')
 def home():
-    return render_template_string(HTML_LAYOUT, config=BOT_CONFIG, stats=STATS)
+    return render_template_string(HTML_LAYOUT, config=BOT_CONFIG, stats=STATS, trades=ACTIVE_TRADES)
 
 @app.route('/update-settings', methods=['POST'])
 def update_settings():
@@ -186,8 +254,25 @@ def update_settings():
 
     if action == "test_tg":
         send_telegram_reply("✅ <b>CryptoScalper AJ Connectivity Test Successful!</b>")
+    
+    elif action == "test_signal":
+        # Create a Dummy Test Signal
+        dummy_signal = {
+            "symbol": "BTC/USDT (TEST)",
+            "side": "🟢 LONG",
+            "entry": 67500.00,
+            "sl": 66800.00,
+            "tp2": 68900.00,
+            "hit_entry": True
+        }
+        STATS["total_signals"] += 1
+        ACTIVE_TRADES.insert(0, dummy_signal) # Top row display
+        STATS["active_signals"] = len(ACTIVE_TRADES)
+        
+        # Send Alert to Telegram Channel
+        send_telegram_alert(dummy_signal)
 
-    return render_template_string(HTML_LAYOUT, config=BOT_CONFIG, stats=STATS)
+    return render_template_string(HTML_LAYOUT, config=BOT_CONFIG, stats=STATS, trades=ACTIVE_TRADES)
 
 @app.route('/health')
 def health():
