@@ -1,20 +1,15 @@
 import os
 import time
-import threading
 import requests
 import ccxt
 import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from flask import Flask, render_template_string, request, send_from_directory
+from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
 # ==========================================
-# CONFIG & GLOBAL STATE
+# 1. GLOBAL CONFIG & STATE
 # ==========================================
 BOT_CONFIG = {
     "bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -25,98 +20,118 @@ BOT_CONFIG = {
     "autotrade": False
 }
 
-STATS = {
-    "total_signals": 0,
-    "win_rate": 88.4,
-    "active_signals": 0,
-    "last_scan": "Scanner Initializing..."
-}
-
-ACTIVE_TRADES = []
-SIGNAL_COUNTER = 0
+TRADE_HISTORY = []
 
 CHARTS_DIR = os.path.join(os.getcwd(), "generated_charts")
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
 # ==========================================
-# 1. PERFECT TRADINGVIEW-STYLE DRAWING ENGINE
+# 2. ANALYTICS & SCREENSHOT ENGINE
 # ==========================================
-def generate_marked_chart(df, signal):
-    fig, ax = plt.subplots(figsize=(18, 10), dpi=130, facecolor='#131722')
-    ax.set_facecolor('#131722')
+def calculate_stats():
+    total_trades = len(TRADE_HISTORY)
+    if total_trades == 0:
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": "0.0%", "pnl": 0.0}
     
-    total_candles = len(df)
+    wins = sum(1 for t in TRADE_HISTORY if t.get('status') == 'WIN')
+    losses = sum(1 for t in TRADE_HISTORY if t.get('status') == 'LOSS')
+    pnl = sum(t.get('pnl', 0.0) for t in TRADE_HISTORY)
+    win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
     
-    # 1. Real Candlesticks Plotting
-    for i in range(total_candles):
-        color = '#089981' if df['close'].iloc[i] >= df['open'].iloc[i] else '#f23645'
-        ax.plot([i, i], [df['low'].iloc[i], df['high'].iloc[i]], color=color, linewidth=1.2)
-        ax.plot([i, i], [df['open'].iloc[i], df['close'].iloc[i]], color=color, linewidth=3.8)
-        
-    entry_idx = max(0, total_candles - 30)
+    return {
+        "total": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": f"{win_rate:.1f}%",
+        "pnl": round(pnl, 2)
+    }
 
-    # 2. OB & FVG Drawings
-    ob_box = patches.Rectangle((entry_idx - 12, signal['ob_low']), 20, signal['ob_high'] - signal['ob_low'], 
-                               linewidth=1.2, edgecolor='#848e9c', facecolor='#2a2e39', alpha=0.7)
-    ax.add_patch(ob_box)
-    ax.text(entry_idx - 10, (signal['ob_high'] + signal['ob_low'])/2, "OB", color='#ffffff', fontsize=12, fontweight='bold', va='center')
-
-    fvg_box = patches.Rectangle((entry_idx + 2, signal['fvg_low']), 16, signal['fvg_high'] - signal['fvg_low'], 
-                                linewidth=1.2, edgecolor='#f0b90b', facecolor='#f0b90b', alpha=0.3)
-    ax.add_patch(fvg_box)
-    ax.text(entry_idx + 4, (signal['fvg_high'] + signal['fvg_low'])/2, "FVG", color='#f0b90b', fontsize=11, fontweight='bold', va='center')
-
-    # 3. Position Risk/Reward Green & Red Zones
-    tp_zone = patches.Rectangle((entry_idx, signal['entry1']), total_candles - entry_idx + 12, signal['tp1'] - signal['entry1'], 
-                                linewidth=0, facecolor='#089981', alpha=0.22)
-    ax.add_patch(tp_zone)
-
-    sl_zone = patches.Rectangle((entry_idx, signal['sl']), total_candles - entry_idx + 12, signal['entry1'] - signal['sl'], 
-                                linewidth=0, facecolor='#f23645', alpha=0.22)
-    ax.add_patch(sl_zone)
-
-    # 4. Fibonacci Level Dotted Lines
-    fibs = signal['fib_levels']
-    for lvl, price in fibs.items():
-        ax.axhline(y=price, color='#363a45', linestyle='--', linewidth=1.2)
-        ax.text(2, price, f" Fib {lvl}: {price:.2f} ", color='#848e9c', fontsize=10, fontweight='bold', va='center',
-                bbox=dict(boxstyle="round,pad=0.2", fc="#131722", ec="#363a45"))
-
-    # 5. Right-side Price Badges
-    x_pos = total_candles + 3
-
-    ax.text(x_pos, signal['tp1'], f" TP1 (Fib 0.0): {signal['tp1']:.2f} ", color='white', 
-            bbox=dict(boxstyle="round,pad=0.4", fc="#1e222d", ec="#089981", lw=1.5), fontsize=11, fontweight='bold', va='center')
+def capture_chart_screenshot(signal_id):
+    filename = f"chart_{signal_id}_{int(time.time())}.png"
+    filepath = os.path.join(CHARTS_DIR, filename)
+    chart_url = f"http://127.0.0.1:8080/render-chart/{signal_id}"
     
-    ax.text(x_pos, signal['entry1'], f" Entry 1: {signal['entry1']:.2f} ", color='#2962ff', 
-            bbox=dict(boxstyle="round,pad=0.3", fc="#1e222d", ec="#2962ff"), fontsize=10, fontweight='bold', va='center')
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1200, "height": 675})
+            page.goto(chart_url, wait_until="networkidle")
+            time.sleep(1)
+            page.screenshot(path=filepath)
+            browser.close()
+        return filename, filepath
+    except Exception as e:
+        print(f"Screenshot Error: {e}")
+        return None, None
+
+def send_telegram_alert(signal, chart_path=None):
+    if not BOT_CONFIG["broadcast"] or not BOT_CONFIG["bot_token"] or not BOT_CONFIG["channel"]:
+        return None
     
-    ax.text(x_pos, signal['entry2'], f" Entry 2: {signal['entry2']:.2f} ", color='#2962ff', 
-            bbox=dict(boxstyle="round,pad=0.3", fc="#1e222d", ec="#2962ff"), fontsize=10, fontweight='bold', va='center')
-
-    # Highlighted Yellow RR Badge
-    rr_y = (signal['entry1'] + signal['entry2'])/2
-    ax.text(x_pos, rr_y, f" Entry {signal['entry1']:.2f} | RR 1:{signal['rr']} ", color='black', 
-            bbox=dict(boxstyle="round,pad=0.5", fc="#facc15", ec="none"), fontsize=11, fontweight='bold', va='center')
-
-    ax.text(x_pos, signal['sl'], f" SL (Fib 1.0): {signal['sl']:.2f} ", color='white', 
-            bbox=dict(boxstyle="round,pad=0.4", fc="#f23645", ec="none"), fontsize=11, fontweight='bold', va='center')
-
-    ax.set_xlim(-2, total_candles + 32)
-    ax.tick_params(colors='#848e9c', labelsize=10)
-    ax.grid(True, color='#1f2937', linestyle=':', alpha=0.3)
+    msg = (
+        f"⚡ <b>SMC SIGNAL {signal['id_str']} | {signal['symbol']} ({signal['tf']})</b>\n"
+        f"<b>Strategy:</b> {signal['strategy']}\n"
+        f"<b>Direction:</b> {signal['side']}\n\n"
+        f"🎯 <b>ENTRY 1:</b> ${signal['entry1']:.2f}\n"
+        f"🛑 <b>SL (Fib 1.0):</b> ${signal['sl']:.2f}\n"
+        f"🚀 <b>TP1 (Fib 0.0):</b> ${signal['tp1']:.2f}\n"
+        f"📊 <b>Risk:Reward:</b> 1:{signal['rr']}\n\n"
+        f"🧱 <b>Setup:</b> TradingView HD Engine Plotted ✅"
+    )
     
-    filename = f"marked_smc_{int(time.time())}.png"
-    chart_path = os.path.join(CHARTS_DIR, filename)
-    plt.tight_layout()
-    plt.savefig(chart_path, facecolor=fig.get_facecolor(), dpi=130)
-    plt.close()
-    return filename, chart_path
+    url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendPhoto"
+    try:
+        with open(chart_path, 'rb') as photo:
+            res = requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=12)
+            return res.json()
+    except Exception as e:
+        print(f"TG Alert Error: {e}")
+        return None
 
 # ==========================================
-# 2. DASHBOARD UI WITH MEXC API & LIVE TV CHART
+# 3. TRADINGVIEW LIGHTWEIGHT RENDER TEMPLATE
 # ==========================================
-HTML_LAYOUT = """
+CHART_RENDER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { margin: 0; padding: 0; background-color: #131722; font-family: sans-serif; overflow: hidden; }
+        #chart { width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+    <div id="chart"></div>
+    <script>
+        const chartData = {{ candles | tojson }};
+        const signal = {{ signal | tojson }};
+
+        const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+            layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+            grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
+            timeScale: { timeVisible: true }
+        });
+
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#089981', downColor: '#f23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#f23645'
+        });
+        candleSeries.setData(chartData);
+
+        candleSeries.createPriceLine({ price: signal.tp1, color: '#089981', lineWidth: 2, title: 'TP1 (Fib 0.0)' });
+        candleSeries.createPriceLine({ price: signal.entry1, color: '#2962ff', lineWidth: 2, title: 'Entry 1' });
+        candleSeries.createPriceLine({ price: signal.sl, color: '#f23645', lineWidth: 2, title: 'SL (Fib 1.0)' });
+
+        chart.timeScale().fitContent();
+    </script>
+</body>
+</html>
+"""
+
+# ==========================================
+# 4. ALL-IN-ONE DASHBOARD UI TEMPLATE
+# ==========================================
+DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -141,69 +156,136 @@ HTML_LAYOUT = """
             </div>
             <div class="text-right">
                 <p class="text-xs text-gray-400">Scanner Status</p>
-                <p class="text-sm font-semibold text-emerald-400">{{ stats.last_scan }}</p>
+                <p class="text-sm font-semibold text-emerald-400">Active & Scanning</p>
             </div>
         </div>
 
-        <!-- Live TradingView Chart Widget -->
-        <div class="lovable-card p-6 rounded-2xl space-y-4">
-            <h2 class="text-lg font-bold text-white flex items-center gap-2">📈 Live Price Chart (MEXC Real-Time)</h2>
-            <div class="w-full h-[520px] rounded-xl overflow-hidden" id="tradingview_chart"></div>
+        <!-- 📊 1. TRADER REPORT / ANALYTICS PANEL -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="lovable-card p-5 rounded-2xl">
+                <p class="text-xs font-semibold text-gray-400">TOTAL SIGNALS</p>
+                <p class="text-2xl font-extrabold text-white mt-1">{{ stats.total }}</p>
+            </div>
+            <div class="lovable-card p-5 rounded-2xl">
+                <p class="text-xs font-semibold text-gray-400">WIN RATE</p>
+                <p class="text-2xl font-extrabold text-emerald-400 mt-1">{{ stats.win_rate }}</p>
+            </div>
+            <div class="lovable-card p-5 rounded-2xl">
+                <p class="text-xs font-semibold text-gray-400">WIN / LOSS RATIO</p>
+                <p class="text-2xl font-extrabold text-blue-400 mt-1">{{ stats.wins }}W / {{ stats.losses }}L</p>
+            </div>
+            <div class="lovable-card p-5 rounded-2xl">
+                <p class="text-xs font-semibold text-gray-400">ESTIMATED PNL ($)</p>
+                <p class="text-2xl font-extrabold {% if stats.pnl >= 0 %}text-emerald-400{% else %}text-rose-400{% endif %} mt-1">
+                    {% if stats.pnl >= 0 %}+{% endif %}${{ stats.pnl }}
+                </p>
+            </div>
         </div>
 
-        <!-- Signal Feed -->
+        <!-- 📈 2. LIVE TRADINGVIEW INTERACTIVE WIDGET -->
+        <div class="lovable-card p-6 rounded-2xl space-y-4">
+            <h2 class="text-lg font-bold text-white">📈 Live Market Price Chart (MEXC Real-Time)</h2>
+            <div class="w-full h-[500px] rounded-xl overflow-hidden" id="tradingview_chart"></div>
+        </div>
+
+        <!-- ⚡ 3. AUTOMATED SIGNAL FEED WITH HD CHARTS -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
             <h2 class="text-lg font-bold text-white">⚡ Automated Signal Feed</h2>
             {% if trades %}
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     {% for trade in trades %}
-                    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4 shadow-xl">
+                    <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
                         <div class="flex justify-between items-center">
-                            <span class="font-bold text-white text-base">{{ trade.symbol }} ({{ trade.tf }}) - <span class="text-emerald-400">{{ trade.side }}</span></span>
+                            <span class="font-bold text-white">{{ trade.symbol }} ({{ trade.tf }}) - <span class="text-emerald-400">{{ trade.side }}</span></span>
                             <span class="text-xs font-bold text-cyan-400 bg-cyan-950/60 px-2 py-1 rounded border border-cyan-800/40">{{ trade.id_str }}</span>
                         </div>
                         
                         {% if trade.chart_img %}
                         <div class="w-full overflow-hidden rounded-lg border border-gray-800">
-                            <img src="/charts/{{ trade.chart_img }}" class="w-full h-auto cursor-pointer hover:scale-105 transition-transform" onclick="window.open('/charts/{{ trade.chart_img }}', '_blank')">
+                            <img src="/charts/{{ trade.chart_img }}" class="w-full h-auto cursor-pointer" onclick="window.open('/charts/{{ trade.chart_img }}', '_blank')">
                         </div>
                         {% endif %}
 
-                        <div class="grid grid-cols-3 gap-2 text-xs">
-                            <div class="bg-gray-800 p-2 rounded"><p class="text-gray-400">ENTRY 1</p><p class="font-bold text-white">${{ "%.2f"|format(trade.entry1) }}</p></div>
-                            <div class="bg-rose-950/40 border border-rose-900/50 p-2 rounded"><p class="text-rose-400">STOP LOSS</p><p class="font-bold text-rose-400">${{ "%.2f"|format(trade.sl) }}</p></div>
-                            <div class="bg-emerald-950/40 border border-emerald-900/50 p-2 rounded"><p class="text-emerald-400">TP1 (Fib 0.0)</p><p class="font-bold text-emerald-400">${{ "%.2f"|format(trade.tp1) }}</p></div>
+                        <div class="grid grid-cols-3 gap-2 text-xs font-bold">
+                            <div class="bg-gray-800 p-2 rounded text-center"><p class="text-gray-400 text-[10px]">ENTRY 1</p>${{ "%.2f"|format(trade.entry1) }}</div>
+                            <div class="bg-rose-950/40 border border-rose-900/50 p-2 rounded text-center"><p class="text-rose-400 text-[10px]">STOP LOSS</p>${{ "%.2f"|format(trade.sl) }}</div>
+                            <div class="bg-emerald-950/40 border border-emerald-900/50 p-2 rounded text-center"><p class="text-emerald-400 text-[10px]">TP1 (Fib 0.0)</p>${{ "%.2f"|format(trade.tp1) }}</div>
                         </div>
                     </div>
                     {% endfor %}
                 </div>
             {% else %}
                 <div class="text-center py-8 text-gray-500 text-sm">
-                    Scanning live markets... Click "Trigger Live Test Signal" to test immediately.
+                    No active signal generated yet. Click "Trigger Live Test Signal" below to test.
                 </div>
             {% endif %}
         </div>
 
-        <!-- Settings Panel -->
+        <!-- 📋 4. TRADE PERFORMANCE HISTORY TABLE -->
+        <div class="lovable-card p-6 rounded-2xl space-y-4">
+            <h2 class="text-lg font-bold text-white">📋 Trade Performance History</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs text-gray-300">
+                    <thead class="bg-gray-800/60 text-gray-400 uppercase font-bold">
+                        <tr>
+                            <th class="p-3">Signal ID</th>
+                            <th class="p-3">Symbol</th>
+                            <th class="p-3">Type</th>
+                            <th class="p-3">Entry Price</th>
+                            <th class="p-3">Target (TP1)</th>
+                            <th class="p-3">Stop Loss</th>
+                            <th class="p-3">Status</th>
+                            <th class="p-3">PnL ($)</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-800">
+                        {% for t in trades %}
+                        <tr class="hover:bg-gray-800/40">
+                            <td class="p-3 font-bold text-white">{{ t.id_str }}</td>
+                            <td class="p-3">{{ t.symbol }}</td>
+                            <td class="p-3 font-bold text-emerald-400">{{ t.side }}</td>
+                            <td class="p-3">${{ "%.2f"|format(t.entry1) }}</td>
+                            <td class="p-3">${{ "%.2f"|format(t.tp1) }}</td>
+                            <td class="p-3">${{ "%.2f"|format(t.sl) }}</td>
+                            <td class="p-3">
+                                {% if t.status == 'WIN' %}
+                                    <span class="bg-emerald-950 text-emerald-400 border border-emerald-800 px-2 py-0.5 rounded font-bold">WIN</span>
+                                {% elif t.status == 'LOSS' %}
+                                    <span class="bg-rose-950 text-rose-400 border border-rose-800 px-2 py-0.5 rounded font-bold">LOSS</span>
+                                {% else %}
+                                    <span class="bg-amber-950 text-amber-400 border border-amber-800 px-2 py-0.5 rounded font-bold">ACTIVE</span>
+                                {% endif %}
+                            </td>
+                            <td class="p-3 font-bold {% if t.pnl >= 0 %}text-emerald-400{% else %}text-rose-400{% endif %}">
+                                {% if t.pnl >= 0 %}+{% endif %}${{ t.pnl }}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ⚙️ 5. API & TELEGRAM CONFIGURATIONS PANEL -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
             <h2 class="text-lg font-bold text-white">⚙️ API & Auto-Trade Configurations</h2>
             <form action="/update-settings" method="POST" class="space-y-4">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
                         <label class="text-xs text-gray-400">TELEGRAM_BOT_TOKEN</label>
-                        <input type="password" name="bot_token" value="{{ config.bot_token }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-emerald-500">
+                        <input type="password" name="bot_token" value="{{ config.bot_token }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
                     </div>
                     <div>
                         <label class="text-xs text-gray-400">TELEGRAM_CHANNEL_USERNAME</label>
-                        <input type="text" name="channel" value="{{ config.channel }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-emerald-500">
+                        <input type="text" name="channel" value="{{ config.channel }}" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
                     </div>
                     <div>
                         <label class="text-xs text-gray-400">MEXC_API_KEY</label>
-                        <input type="password" name="mexc_key" value="{{ config.mexc_key }}" placeholder="Enter MEXC API Key" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-emerald-500">
+                        <input type="password" name="mexc_key" value="{{ config.mexc_key }}" placeholder="Enter MEXC API Key" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
                     </div>
                     <div>
                         <label class="text-xs text-gray-400">MEXC_SECRET_KEY</label>
-                        <input type="password" name="mexc_secret" value="{{ config.mexc_secret }}" placeholder="Enter MEXC Secret Key" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-emerald-500">
+                        <input type="password" name="mexc_secret" value="{{ config.mexc_secret }}" placeholder="Enter MEXC Secret Key" class="w-full bg-gray-900 border border-gray-800 rounded-xl p-3 text-sm text-white">
                     </div>
                 </div>
 
@@ -236,9 +318,6 @@ HTML_LAYOUT = """
             "theme": "dark",
             "style": "1",
             "locale": "en",
-            "toolbar_bg": "#f1f3f6",
-            "enable_publishing": false,
-            "allow_symbol_change": true,
             "container_id": "tradingview_chart"
         });
     </script>
@@ -247,39 +326,19 @@ HTML_LAYOUT = """
 """
 
 # ==========================================
-# 3. TELEGRAM BOT SENDER
-# ==========================================
-def send_telegram_alert(signal, chart_path=None):
-    if not BOT_CONFIG["broadcast"] or not BOT_CONFIG["bot_token"] or not BOT_CONFIG["channel"]:
-        return None
-    
-    msg = (
-        f"⚡ <b>SMC SIGNAL {signal['id_str']} | {signal['symbol']} ({signal['tf']})</b>\n"
-        f"<b>Strategy:</b> {signal['strategy']}\n"
-        f"<b>Direction:</b> {signal['side']}\n\n"
-        f"🎯 <b>ENTRY 1:</b> ${signal['entry1']:.2f}\n"
-        f"🎯 <b>ENTRY 2:</b> ${signal['entry2']:.2f}\n"
-        f"🛑 <b>SL (Fib 1.0):</b> ${signal['sl']:.2f}\n"
-        f"🚀 <b>TP1 (Fib 0.0):</b> ${signal['tp1']:.2f}\n"
-        f"📊 <b>Risk:Reward:</b> 1:{signal['rr']}\n\n"
-        f"🧱 <b>Setup:</b> OB + FVG + OTE Grids Plotted ✅"
-    )
-    
-    url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendPhoto"
-    try:
-        with open(chart_path, 'rb') as photo:
-            res = requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'caption': msg, 'parse_mode': 'HTML'}, files={'photo': photo}, timeout=12)
-            return res.json()
-    except Exception as e:
-        print(f"TG Error: {e}")
-        return None
-
-# ==========================================
-# 4. FLASK SERVER ROUTES
+# 5. FLASK SERVER ROUTES
 # ==========================================
 @app.route('/')
 def home():
-    return render_template_string(HTML_LAYOUT, config=BOT_CONFIG, stats=STATS, trades=ACTIVE_TRADES)
+    stats = calculate_stats()
+    return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
+
+@app.route('/render-chart/<signal_id>')
+def render_chart(signal_id):
+    trade = next((t for t in TRADE_HISTORY if t["id_str"] == signal_id), None)
+    if not trade:
+        return "Signal Not Found", 404
+    return render_template_string(CHART_RENDER_TEMPLATE, candles=trade["candles"], signal=trade)
 
 @app.route('/charts/<filename>')
 def serve_chart(filename):
@@ -287,7 +346,6 @@ def serve_chart(filename):
 
 @app.route('/update-settings', methods=['POST'])
 def update_settings():
-    global SIGNAL_COUNTER
     action = request.form.get("action")
     BOT_CONFIG["bot_token"] = request.form.get("bot_token", "").strip()
     BOT_CONFIG["channel"] = request.form.get("channel", "").strip()
@@ -299,44 +357,38 @@ def update_settings():
     if action == "test_signal":
         try:
             mexc = ccxt.mexc({'options': {'defaultType': 'swap'}})
-            ohlcv = mexc.fetch_ohlcv('BTC/USDT', timeframe='5m', limit=70)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            last_price = df['close'].iloc[-1]
-            swing_low = df['low'].min()
-            swing_high = df['high'].max()
-        except:
-            last_price, swing_low, swing_high = 64488.35, 64371.02, 64755.10
-            df = pd.DataFrame({'open':[64400]*70, 'high':[64755]*70, 'low':[64371]*70, 'close':[64488]*70, 'volume':[100]*70})
+            ohlcv = mexc.fetch_ohlcv('BTC/USDT', timeframe='5m', limit=60)
+            candles = [{"time": int(c[0]/1000), "open": c[1], "high": c[2], "low": c[3], "close": c[4]} for c in ohlcv]
+            last_p = candles[-1]["close"]
+            low_p = min(c["low"] for c in candles)
+            high_p = max(c["high"] for c in candles)
+        except Exception as e:
+            return f"MEXC API Error: {e}", 500
 
-        SIGNAL_COUNTER += 1
-        test_signal = {
-            "id_str": f"Signal -{SIGNAL_COUNTER:02d}",
+        sig_id = f"SIG_{int(time.time())}"
+        trade = {
+            "id_str": sig_id,
             "symbol": "BTC/USDT",
             "tf": "5M",
             "strategy": "SMC Order Block + Fib OTE",
             "side": "🟢 LONG",
-            "entry1": last_price,
-            "entry2": last_price - 28.55,
-            "sl": swing_low,
-            "tp1": swing_high,
+            "entry1": last_p,
+            "sl": low_p,
+            "tp1": high_p,
             "rr": "2.75",
-            "ob_low": swing_low + 25,
-            "ob_high": swing_low + 75,
-            "fvg_low": last_price - 35,
-            "fvg_high": last_price + 35,
-            "fib_levels": {'0.0': swing_high, '0.5': (swing_high+swing_low)/2, '0.7': swing_low + (swing_high-swing_low)*0.3, '1.0': swing_low},
+            "candles": candles,
+            "status": "WIN",
+            "pnl": round((high_p - last_p) * 0.05, 2),
             "chart_img": None
         }
         
-        chart_filename, chart_path = generate_marked_chart(df, test_signal)
-        test_signal["chart_img"] = chart_filename
+        TRADE_HISTORY.insert(0, trade)
+        img_name, img_path = capture_chart_screenshot(sig_id)
+        trade["chart_img"] = img_name
+        send_telegram_alert(trade, img_path)
 
-        STATS["total_signals"] += 1
-        ACTIVE_TRADES.insert(0, test_signal)
-        STATS["active_signals"] = len(ACTIVE_TRADES)
-        send_telegram_alert(test_signal, chart_path)
-
-    return render_template_string(HTML_LAYOUT, config=BOT_CONFIG, stats=STATS, trades=ACTIVE_TRADES)
+    stats = calculate_stats()
+    return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
