@@ -1,6 +1,5 @@
 import os
 import time
-import threading
 import requests
 import ccxt
 import pandas as pd
@@ -49,7 +48,6 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
         last_close = df['close'].iloc[-1]
         candles = [{"time": int(row['time_sec']), "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']} for _, row in df.iterrows()]
 
-        # Trap Filter & OTE Zone Validation
         if fib_786 <= last_close <= fib_618:
             sig_id = f"SIG_{int(time.time())}"
             trade = {
@@ -80,8 +78,8 @@ def analyze_smc_fib_strategy(symbol='BTC/USDT', timeframe='5m'):
             "sl": round(recent_low, 2),
             "tp1": round(recent_high, 2),
             "rr": "2.85",
-            "status": "WIN",
-            "pnl": round((recent_high - last_close) * 0.05, 2),
+            "status": "ACTIVE",
+            "pnl": 0.0,
             "chart_img": None,
             "tg_msg_id": None
         }
@@ -207,28 +205,6 @@ def send_trade_update_reply(signal, update_status="WIN"):
     except Exception as e:
         print(f"Reply Update Error: {e}")
 
-def send_daily_report():
-    stats = calculate_stats()
-    report_msg = (
-        f"📊 <b>CRYPTO SCALPER AJ - DAILY REPORT</b> 📈\n\n"
-        f"🏷️ <b>Total Signals:</b> {stats['total']}\n"
-        f"✅ <b>Wins:</b> {stats['wins']} | ❌ <b>Losses:</b> {stats['losses']}\n"
-        f"🎯 <b>Win Rate:</b> {stats['win_rate']}\n"
-        f"💰 <b>Total Net PnL:</b> ${stats['pnl']}"
-    )
-    url = f"https://api.telegram.org/bot{BOT_CONFIG['bot_token']}/sendMessage"
-    try:
-        requests.post(url, data={'chat_id': BOT_CONFIG["channel"], 'text': report_msg, 'parse_mode': 'HTML'}, timeout=10)
-    except Exception as e:
-        print(f"Daily Report Error: {e}")
-
-def daily_scheduler():
-    while True:
-        time.sleep(86400)
-        send_daily_report()
-
-threading.Thread(target=daily_scheduler, daemon=True).start()
-
 # ==========================================
 # 4. DASHBOARD UI TEMPLATE
 # ==========================================
@@ -253,7 +229,7 @@ DASHBOARD_TEMPLATE = """
         <div class="flex flex-col md:flex-row justify-between items-center p-6 rounded-2xl lovable-card gap-4">
             <div>
                 <h1 class="text-3xl font-extrabold text-emerald-400">CryptoScalper AJ</h1>
-                <p class="text-xs text-gray-400 mt-1">SMC & Fib OTE Engine with Trap Filter & Smart Telegram Reply</p>
+                <p class="text-xs text-gray-400 mt-1">SMC & Fib OTE Engine with Live Chart Drawings & Telegram Reply System</p>
             </div>
             <div class="text-right">
                 <p class="text-xs text-gray-400">Scanner Status</p>
@@ -283,7 +259,7 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
 
-        <!-- 📈 TRADINGVIEW WIDGET -->
+        <!-- 📈 TRADINGVIEW LIVE WIDGET -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
             <h2 class="text-lg font-bold text-white">📈 Live Market Price Chart (MEXC Real-Time)</h2>
             <div class="w-full h-[500px] rounded-xl overflow-hidden" id="tradingview_chart"></div>
@@ -291,7 +267,7 @@ DASHBOARD_TEMPLATE = """
 
         <!-- ⚡ AUTOMATED SIGNAL FEED -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
-            <h2 class="text-lg font-bold text-white">⚡ Automated Signal Feed</h2>
+            <h2 class="text-lg font-bold text-white">⚡ Automated Signal Feed & Drawn Setup Charts</h2>
             {% if trades %}
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     {% for trade in trades %}
@@ -322,9 +298,9 @@ DASHBOARD_TEMPLATE = """
             {% endif %}
         </div>
 
-        <!-- 📋 TRADE PERFORMANCE HISTORY TABLE -->
+        <!-- 📋 TRADE PERFORMANCE HISTORY & TELEGRAM REPLY -->
         <div class="lovable-card p-6 rounded-2xl space-y-4">
-            <h2 class="text-lg font-bold text-white">📋 Trade Performance & Telegram Reply Trigger</h2>
+            <h2 class="text-lg font-bold text-white">📋 Trade Performance & Telegram Reply Control</h2>
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs text-gray-300">
                     <thead class="bg-gray-800/60 text-gray-400 uppercase font-bold">
@@ -334,7 +310,7 @@ DASHBOARD_TEMPLATE = """
                             <th class="p-3">Type</th>
                             <th class="p-3">Entry</th>
                             <th class="p-3">Status</th>
-                            <th class="p-3">Action / Send Reply</th>
+                            <th class="p-3">Trigger Reply on Telegram</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-gray-800">
@@ -379,8 +355,7 @@ DASHBOARD_TEMPLATE = """
                     </div>
                 </div>
                 <div class="flex flex-wrap gap-3 pt-3">
-                    <button type="submit" name="action" value="test_signal" class="px-5 py-2.5 bg-amber-600 text-white font-bold rounded-xl text-xs hover:bg-amber-500 transition">⚡ Trigger Live Test Signal</button>
-                    <button type="submit" name="action" value="daily_report" class="px-5 py-2.5 bg-cyan-600 text-white font-bold rounded-xl text-xs hover:bg-cyan-500 transition">📊 Send Daily Report Now</button>
+                    <button type="submit" name="action" value="test_signal" class="px-5 py-2.5 bg-amber-600 text-white font-bold rounded-xl text-xs hover:bg-amber-500 transition">⚡ Trigger Live Test Signal & Draw Chart</button>
                     <button type="submit" name="action" value="save" class="px-6 py-2.5 bg-emerald-600 text-white font-bold rounded-xl text-xs hover:bg-emerald-500 transition">Save Configurations</button>
                 </div>
             </form>
@@ -450,8 +425,6 @@ def update_settings():
             msg_id = send_telegram_alert(trade, img_path)
             trade["tg_msg_id"] = msg_id
             TRADE_HISTORY.insert(0, trade)
-    elif action == "daily_report":
-        send_daily_report()
 
     stats = calculate_stats()
     return render_template_string(DASHBOARD_TEMPLATE, config=BOT_CONFIG, trades=TRADE_HISTORY, stats=stats)
