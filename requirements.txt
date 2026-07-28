@@ -1,7 +1,7 @@
-Flask
-gunicorn
-requests
+Flask==3.0.2
+gunicorn==21.2.0
+requests==2.31.0
+ccxt==4.2.25
 pandas
 numpy
 matplotlib
-ccxt
